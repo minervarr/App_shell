@@ -11,6 +11,10 @@
 #include <windowsx.h>
 #include <dbghelp.h>
 #include <mmsystem.h>
+#include <shellapi.h>   // ShellExecuteW, for openUrl()
+#include <objbase.h>    // CoInitializeEx / CoCreateInstance / CoTaskMemFree
+#include <shlobj.h>     // IShellItem
+#include <shobjidl.h>   // IFileOpenDialog, CLSID_FileOpenDialog
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
@@ -26,6 +30,28 @@
 namespace {
 
 const wchar_t* kMainClass = APP_SHELL_WINDOW_CLASS;
+
+// ── UTF-8 <-> UTF-16, for the wide half of the Win32 API ────────────────────
+//
+// Everything in this library speaks UTF-8; every W-suffixed Win32 call speaks
+// UTF-16. WideCharToMultiByte with CP_UTF8 is the correct conversion in both
+// directions — unlike JNI's, it is real UTF-8 and needs no help.
+std::wstring widen(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+std::string narrow(const wchar_t* w) {
+    if (!w || !*w) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string s((size_t)n - 1, '\0');   // n counts the terminator
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
 
 // Borderless: no title bar/icon/min-max-close buttons at all. The window is a
 // fixed size the app sets itself (true fullscreen), so there's no
@@ -80,7 +106,7 @@ public:
         HMONITOR primaryMon = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
         RECT startRect = computeCompleteWindowRect(primaryMon);
 
-        hwnd_ = CreateWindowExW(kFixedWindowExStyle, kMainClass, L"Matrix Player",
+        hwnd_ = CreateWindowExW(kFixedWindowExStyle, kMainClass, APP_SHELL_WINDOW_TITLE_W,
             kFixedWindowStyle, startRect.left, startRect.top,
             startRect.right - startRect.left, startRect.bottom - startRect.top,
             nullptr, nullptr, hInst_, this);
@@ -250,7 +276,110 @@ public:
 
     HWND nativeHandle() const override { return hwnd_; }
 
+    // ── Platform services (see host.hh) ─────────────────────────────────────
+    //
+    // showKeyboard/hideKeyboard/keyboardInset are left at their defaults: a
+    // Windows desktop has a physical keyboard and nothing to raise, and the
+    // honest inset is zero.
+
+    void setClipboardText(const std::string& utf8) override {
+        std::wstring w = widen(utf8);
+        if (!OpenClipboard(hwnd_)) return;
+        EmptyClipboard();
+        const size_t bytes = (w.size() + 1) * sizeof(wchar_t);
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (h) {
+            if (void* dst = GlobalLock(h)) {
+                memcpy(dst, w.c_str(), bytes);
+                GlobalUnlock(h);
+                // The clipboard OWNS h once SetClipboardData succeeds — freeing
+                // it then is a double free. Only the failure path is ours.
+                if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+            } else {
+                GlobalFree(h);
+            }
+        }
+        CloseClipboard();
+    }
+
+    std::string getClipboardText() override {
+        if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return {};
+        if (!OpenClipboard(hwnd_)) return {};
+        std::string result;
+        if (HGLOBAL h = GetClipboardData(CF_UNICODETEXT)) {
+            if (const wchar_t* src = static_cast<const wchar_t*>(GlobalLock(h))) {
+                result = narrow(src);
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+        return result;
+    }
+
+    bool openUrl(const std::string& url) override {
+        // Validated before it reaches the shell, exactly as on the other two
+        // hosts: ShellExecuteW on an arbitrary scheme will happily launch a
+        // registered handler for it.
+        if (url.find("://") == std::string::npos) return false;
+        if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return false;
+        std::wstring w = widen(url);
+        HINSTANCE r = ShellExecuteW(nullptr, L"open", w.c_str(),
+                                    nullptr, nullptr, SW_SHOWNORMAL);
+        // ShellExecuteW's "success" is an HINSTANCE greater than 32. A genuine
+        // 1990s API, faithfully reproduced.
+        return reinterpret_cast<INT_PTR>(r) > 32;
+    }
+
+    // The one host where this is real. Synchronous — Show() returns when the
+    // dialog closes — so unlike Android, `cb` runs before this returns.
+    void pickDirectory(std::function<void(const std::string&)> cb) override {
+        if (!cb) return;
+        // COM initialised lazily, and only here: nothing else in this host
+        // needs it, and doing it in init() would impose an apartment model on
+        // every app that never opens a picker.
+        if (!comInit_) {
+            HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED |
+                                                 COINIT_DISABLE_OLE1DDE);
+            // RPC_E_CHANGED_MODE means this thread was already initialised with
+            // a different apartment model. COM is still usable; it just is not
+            // ours. Either way there is no CoUninitialize here — the host lives
+            // as long as the process, so tearing COM down would only risk
+            // pulling it out from under something else.
+            comInit_ = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+        }
+        if (!comInit_) { cb(""); return; }
+
+        IFileOpenDialog* dlg = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                    CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))) || !dlg) {
+            cb("");
+            return;
+        }
+        DWORD opts = 0;
+        dlg->GetOptions(&opts);
+        // PICKFOLDERS makes it a directory chooser; FORCEFILESYSTEM keeps the
+        // result to things with a real path, so a virtual shell location
+        // cannot come back as something std::filesystem cannot open.
+        dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+
+        std::string result;
+        if (SUCCEEDED(dlg->Show(hwnd_))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                    result = narrow(path);
+                    CoTaskMemFree(path);
+                }
+                item->Release();
+            }
+        }
+        dlg->Release();
+        cb(result);
+    }
+
 private:
+    bool comInit_ = false;
     // +1 because SetTimer treats 0 as "allocate one for me". This is the only
     // backend that distinguishes timer ids at all.
     static UINT_PTR timerWinId(int id) { return 1 + (UINT_PTR)id; }

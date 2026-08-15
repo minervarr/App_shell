@@ -39,7 +39,7 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} PARENT_SCOPE)
 # app_shell_android), and this file is left out entirely. Building both is a
 # duplicate-symbol link error, which is exactly the right failure for two
 # implementations of one seam.
-set(APP_SHELL_SOURCES ui_metrics.cc ui_orientation.cc)
+set(APP_SHELL_SOURCES ui_metrics.cc ui_orientation.cc utf16_utf8.cc)
 if(NOT ANDROID)
     list(APPEND APP_SHELL_SOURCES app_paths.cc)
 endif()
@@ -77,11 +77,25 @@ set(APP_SHELL_APP_NAME "app" CACHE STRING
     "Base name for the log file and the Android logcat tag.")
 set(APP_SHELL_WIN_CLASS "AppShellMain" CACHE STRING
     "Win32 window class name for the main window.")
+# The title the USER reads, and the Wayland app_id the compositor matches
+# against a .desktop file. Separate from APP_SHELL_APP_NAME, which names a log
+# file and a logcat tag and so wants to be a bare identifier: this one wants
+# capitals and spaces. Both desktop hosts used to have "Matrix Player" written
+# into them, which is one application's name inside the file that must know no
+# application — and it meant a second consumer's window announced itself as the
+# first one's.
+set(APP_SHELL_WINDOW_TITLE "App" CACHE STRING
+    "Window title shown to the user (and the Wayland app_id, lowercased by the app).")
+set(APP_SHELL_APP_ID "app" CACHE STRING
+    "Wayland app_id / desktop-file base name. Reverse-DNS or a plain slug.")
 
 set(APP_SHELL_NAME_DEFS
     APP_SHELL_LOG_NAME="${APP_SHELL_APP_NAME}"
     APP_SHELL_LOG_NAME_W=L"${APP_SHELL_APP_NAME}"
-    APP_SHELL_WINDOW_CLASS=L"${APP_SHELL_WIN_CLASS}")
+    APP_SHELL_WINDOW_CLASS=L"${APP_SHELL_WIN_CLASS}"
+    APP_SHELL_WINDOW_TITLE="${APP_SHELL_WINDOW_TITLE}"
+    APP_SHELL_WINDOW_TITLE_W=L"${APP_SHELL_WINDOW_TITLE}"
+    APP_SHELL_APP_ID="${APP_SHELL_APP_ID}")
 
 target_compile_definitions(app_shell PUBLIC ${APP_SHELL_NAME_DEFS})
 if(APP_SHELL_STATE_HOME)
@@ -98,7 +112,8 @@ if(WIN32)
     add_library(app_shell_win32 STATIC os/win32_host.cc)
     target_link_libraries(app_shell_win32 PUBLIC app_shell)
     target_include_directories(app_shell_win32 PUBLIC ${VK_CANVAS_DIR}/platform/windows)
-    target_link_libraries(app_shell_win32 PUBLIC dbghelp winmm)
+    # ole32/shell32: the folder picker (IFileOpenDialog) and ShellExecuteW.
+    target_link_libraries(app_shell_win32 PUBLIC dbghelp winmm ole32 shell32)
 elseif(ANDROID)
     # native_app_glue ships inside the NDK, so only the consumer knows where it
     # is. It must be set before this file is read.
@@ -107,7 +122,18 @@ elseif(ANDROID)
             "app_shell on Android needs APP_SHELL_NATIVE_APP_GLUE_DIR "
             "(the NDK's sources/android/native_app_glue)")
     endif()
+    # activity_bridge.cc is the C++ end of
+    # platform/android/java/io/nava/appshell/AppShellActivity.java. The Java
+    # half is NOT compiled here — it is Gradle's — so a consumer must add that
+    # directory to its own sourceSets:
+    #
+    #   sourceSets.main.java.srcDirs += '<app_shell>/platform/android/java'
+    #
+    # Without it the JNI method lookups simply fail and every service this
+    # file offers becomes a no-op, which is a quiet degradation rather than a
+    # crash — see the exception handling in activity_bridge.cc.
     add_library(app_shell_android STATIC
+        os/activity_bridge.cc
         os/android_host.cc
         os/app_paths_android.cc
         os/launch_intent.cc
@@ -138,4 +164,11 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT ANDROID)
 
     add_executable(ui_orientation_test tests/ui_orientation_test.cc ui_orientation.cc)
     target_include_directories(ui_orientation_test PRIVATE ${APP_SHELL_DIR})
+
+    # Pure conversion, so it needs no NDK and no JNI header — which is exactly
+    # why the JNI types are kept out of utf16_utf8.hh. The surrogate-pair cases
+    # are the ones that matter and they are unreachable from a desktop app, so
+    # this test is the only thing that ever exercises them here.
+    add_executable(utf16_utf8_test tests/utf16_utf8_test.cc utf16_utf8.cc)
+    target_include_directories(utf16_utf8_test PRIVATE ${APP_SHELL_DIR})
 endif()

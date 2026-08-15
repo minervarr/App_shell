@@ -28,9 +28,10 @@
 // window position a client may set. Those are no-ops here exactly as several
 // of them already are on Wayland.
 //
-// Still missing, and NOT hidden: there is no keyboard, so onCharPortable() is
-// never fed and the guided-search box can be seen but not typed into. Wiring
-// the IME is separate work.
+// Text input WORKS, and it is the one thing here that needs a Java half: see
+// os/activity_bridge.hh and AppShellActivity. An input method is not a stream
+// of key presses, so onCharPortable() is still never fed on this platform —
+// onTextEditPortable() is, carrying the field's whole contents.
 class AndroidHost : public Host {
 public:
     // `launchExtraKey` names the intent extra launchArgument() should return
@@ -75,6 +76,20 @@ public:
     void stopTimer(int id) override;
     std::string launchArgument() const override;
 
+    // ── Platform services (see host.hh) ─────────────────────────────────────
+    // All of these go through AppShellActivity — see os/activity_bridge.hh.
+    // A consumer whose activity does NOT extend it still links and runs; the
+    // JNI method lookups simply fail and each call becomes a no-op, which is
+    // why every helper there clears the pending exception.
+    void showKeyboard(const std::string& text, size_t cursorByte) override;
+    void hideKeyboard() override;
+    int  keyboardInset() const override { return imeBottom_; }
+
+    void setClipboardText(const std::string& utf8) override;
+    std::string getClipboardText() override;
+    bool openUrl(const std::string& url) override;
+    void pickDirectory(std::function<void(const std::string&)> cb) override;
+
     void pump(bool haveWork) override;
     bool quitRequested() const override;
 
@@ -111,9 +126,15 @@ private:
     // replaces was unconditional and ran on every window init, which is a
     // loop, not a prompt.
     void ensureStoragePermission();
-    // Makes the launch intent's scan root a music root in the DB the first
-    // time it can, then lets PlayerWindow's own background scan do the work.
-    void maybeSeedMusicRoot();
+    // Fires AppView::onHostReady() once, at the first moment it is honest to:
+    // the app fully constructed AND storage access settled, so that whatever
+    // the app does with launchArgument() has somewhere to do it.
+    //
+    // It used to be called maybeSeedMusicRoot() and its comment described a
+    // scan root going into a database — one application's vocabulary in the
+    // file that is supposed to know nothing about it. The BODY was already
+    // generic; only the name was not.
+    void maybeSignalHostReady();
 
     android_app*  state_ = nullptr;
     AppView*    owner_          = nullptr;
@@ -155,7 +176,18 @@ private:
     bool  lastTapValid_ = false;
 
     bool storageAsked_ = false;
-    bool rootSeeded_   = false;
+    bool hostReadySignalled_   = false;
+
+    // Pixels of the bottom edge the on-screen keyboard is covering, pushed up
+    // from AppShellActivity and latched here. Deliberately NOT folded into
+    // cachedInsets_ below: that one is the cutout, which is permanent, and
+    // this one comes and goes. See Host::keyboardInset().
+    int imeBottom_ = 0;
+
+    // Drains os/activity_bridge.hh's slot into owner_. Called from pump(),
+    // which is the only place touching app state from a system callback is
+    // safe — the IME reports on Android's UI thread, not this one.
+    void drainActivity();
 
     // The cutout, cached because safeInsets() is called from every layout pass
     // and answering it costs a chain of five JNI calls. Refreshed where the

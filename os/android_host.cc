@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <thread>
 
+#include "activity_bridge.hh"    // the IME/clipboard/URL seam onto AppShellActivity
+#include "keys.hh"               // vk_canvas: the portable key:: space
 #include "app_main.hh"           // APP_SHELL_LOG_NAME, the logcat tag
 #include "app_paths.hh"          // the exeDir()/stateDir() seam itself
 #include "app_paths_android.hh"  // and this platform's one-time setter for it
@@ -112,6 +114,9 @@ AndroidHost::AndroidHost(android_app* state, const char* launchExtraKey,
     // First thing, before any of the app's own code can print: everything
     // player_view.cc and the engine report is otherwise thrown away here.
     redirect_stdio_to_logcat();
+    // Before any JNI entry point can fire: the down-calls arrive on Android's
+    // UI thread, which has no other way to reach the android_app.
+    activity::set_app(state);
     state_->userData     = this;
     state_->onAppCmd     = handleAppCmd;
     state_->onInputEvent = handleInputEvent;
@@ -194,6 +199,67 @@ SafeInsets AndroidHost::safeInsets() const { return cachedInsets_; }
 void AndroidHost::refreshSafeInsets() {
     const SafeAreaInsets cut = query_safe_area_insets(state_);
     cachedInsets_ = { cut.top, cut.bottom, cut.left, cut.right };
+}
+
+// ── Platform services, all of them through AppShellActivity ─────────────────
+
+void AndroidHost::showKeyboard(const std::string& text, size_t cursorByte) {
+    activity::show_keyboard(text, cursorByte);
+}
+
+void AndroidHost::hideKeyboard() { activity::hide_keyboard(); }
+
+void AndroidHost::setClipboardText(const std::string& utf8) {
+    activity::set_clipboard(utf8);
+}
+
+std::string AndroidHost::getClipboardText() { return activity::get_clipboard(); }
+
+bool AndroidHost::openUrl(const std::string& url) {
+    // Validate here rather than in Java: ACTION_VIEW on an arbitrary scheme
+    // can reach any app on the device, and the C++ side is the one that must
+    // not be talked into handing over something that is not a web address.
+    if (url.find("://") == std::string::npos) return false;
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return false;
+    return activity::open_url(url);
+}
+
+void AndroidHost::pickDirectory(std::function<void(const std::string&)> cb) {
+    // Not implemented, and it says so by calling back with "" — a caller that
+    // never hears anything cannot tell a cancelled picker from a missing one.
+    //
+    // A real one is ACTION_OPEN_DOCUMENT_TREE, whose answer arrives in
+    // onActivityResult on a later trip through the looper. That is genuine
+    // work, and it also returns a content:// TREE URI rather than a path,
+    // which is useless to an app that walks the filesystem with std::filesystem
+    // — so the app that needs it must want the URI, and none does yet.
+    if (cb) cb("");
+}
+
+// Runs on the app thread from inside pump(). Everything it reads was written
+// by Android's UI thread under activity_bridge's lock; this is the point in
+// the frame where handing it to the app is safe.
+void AndroidHost::drainActivity() {
+    activity::Update u;
+    if (!activity::drain(u)) return;
+    if (!appReady_ || !owner_) return;
+
+    if (u.hasText) owner_->onTextEditPortable(u.text, u.cursorByte);
+
+    // The IME's action key is a submit, and an app's text handling already
+    // treats Enter as one — reporting it as a key rather than inventing a
+    // second path keeps one meaning for one gesture. Likewise a dismissal is
+    // Escape: "I am done with this field, and I did not accept it."
+    if (u.committed) owner_->onKeyDownPortable(key::Enter);
+    if (u.dismissed) owner_->onKeyDownPortable(key::Escape);
+
+    if (u.imeInsetChanged && u.imeBottom != imeBottom_) {
+        imeBottom_ = u.imeBottom;
+        // A keyboard appearing changes how much room the app has, which is a
+        // relayout — not a resize, since the window itself did not change
+        // (SOFT_INPUT_ADJUST_NOTHING, see AppShellActivity).
+        owner_->onHostLayoutInvalidated();
+    }
 }
 
 void AndroidHost::setKeepAwake(bool on) {
@@ -284,7 +350,7 @@ void AndroidHost::onResume() {
     // Coming back from the system Settings screen is the ONE moment the
     // storage answer can have changed, and it is the moment
     // storage_permission.hh's own comment says to re-check on.
-    maybeSeedMusicRoot();
+    maybeSignalHostReady();
 }
 
 // ── Storage permission, asked at most once ───────────────────────────────────
@@ -324,21 +390,25 @@ void AndroidHost::ensureStoragePermission() {
 // the app is actually built — and then says onHostReady(). What a launch
 // argument MEANS is answered in AppView::onHostReady(); the string itself comes
 // out of launchArgument() below.
-void AndroidHost::maybeSeedMusicRoot() {
+void AndroidHost::maybeSignalHostReady() {
     // appReady_, not just owner_. owner_ is set at the TOP of init(), while
-    // the database it is about to be asked about is opened after init()
-    // RETURNS — and Android fires APP_CMD_RESUME inside that window. Asking
-    // then is a null sqlite3* dereference and an instant, silent process
-    // death. The guard lives here rather than in each caller because the
-    // requirement belongs to this function, not to the callers who happen to
-    // exist today.
-    if (rootSeeded_ || !appReady_ || !owner_) return;
+    // whatever the app builds for itself — a database, a catalogue, a cache —
+    // is only built after init() RETURNS, and Android fires APP_CMD_RESUME
+    // inside that window. Calling onHostReady() then reaches an app that is
+    // half-constructed: measured once as a null sqlite3* dereference and an
+    // instant, silent process death. The guard lives here rather than in each
+    // caller because the requirement belongs to this function, not to the
+    // callers who happen to exist today.
+    if (hostReadySignalled_ || !appReady_ || !owner_) return;
     ensureStoragePermission();
     if (!has_all_files_access(state_)) {
-        LOGI("storage: no access yet -- deferring the music root");
+        // Deferred, not skipped: the next pump() asks again, so an app whose
+        // launch argument names a path is not told about it until it could
+        // actually be read.
+        LOGI("storage: no access yet -- deferring onHostReady()");
         return;
     }
-    rootSeeded_ = true;
+    hostReadySignalled_ = true;
     owner_->onHostReady();
 }
 
@@ -495,7 +565,7 @@ void AndroidHost::pump(bool haveWork) {
         appReady_ = true;
         // First tick after create(): the app exists now, so this is the
         // earliest honest moment to ask for storage and hand over the root.
-        maybeSeedMusicRoot();
+        maybeSignalHostReady();
     }
 
     // Blocking when there is nothing to draw is what keeps a phone's battery
@@ -516,6 +586,10 @@ void AndroidHost::pump(bool haveWork) {
     // on the ident alone loses whichever it did not name.
     drainEvents();
     drainTimer();
+    // The IME does not go through the looper at all — it arrives on Android's
+    // UI thread and parks in a lock — so it is drained here every time rather
+    // than in response to any descriptor.
+    drainActivity();
 }
 
 bool AndroidHost::quitRequested() const {

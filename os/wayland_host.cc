@@ -12,6 +12,7 @@
 #include "renderer.hh"
 
 #include <sys/timerfd.h>
+#include <sys/wait.h>   // waitpid, for openUrl()'s forked xdg-open
 #include <unistd.h>
 #include <climits>
 #include <csignal>
@@ -51,8 +52,8 @@ public:
             return false;
         }
 
-        window_ = std::make_unique<WaylandWindow>(*display_, "Matrix Player",
-                                                   "matrix-player", kDefaultW, kDefaultH);
+        window_ = std::make_unique<WaylandWindow>(*display_, APP_SHELL_WINDOW_TITLE,
+                                                   APP_SHELL_APP_ID, kDefaultW, kDefaultH);
         if (!window_->valid()) {
             fprintf(stderr, "[LinuxHost] Failed to create Wayland window\n");
             return false;
@@ -192,6 +193,51 @@ public:
         fprintf(stderr, "[%s] %s\n", title.c_str(), msg.c_str());
     }
 
+    // ── Platform services (see host.hh) ─────────────────────────────────────
+
+    // The selection round trip lives in WaylandDisplay, which owns the
+    // wl_data_device this needs; there is nothing left to do here but forward.
+    void setClipboardText(const std::string& utf8) override {
+        display_->set_clipboard_text(utf8);
+    }
+    std::string getClipboardText() override {
+        return display_->get_clipboard_text();
+    }
+
+    bool openUrl(const std::string& url) override {
+        // Validate BEFORE anything reaches exec. This runs with the user's
+        // environment, so a string that is not plainly an http(s) URL must
+        // never get the chance to look like a flag or a second argument to
+        // xdg-open. Rejecting is safe; guessing is not.
+        if (url.find("://") == std::string::npos) return false;
+        if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return false;
+
+        pid_t pid = fork();
+        if (pid < 0) return false;
+        if (pid == 0) {
+            execlp("xdg-open", "xdg-open", url.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        // Reap it: xdg-open returns as soon as it has handed the URL off, so
+        // this does not wait for a browser. Not reaping would leave a zombie
+        // for every link the user ever opens.
+        int status = 0;
+        waitpid(pid, &status, 0);
+        return true;
+    }
+
+    // Not implemented, and it says so by calling back with "" rather than
+    // doing nothing: a caller that never hears back cannot tell a cancelled
+    // picker from a missing one, and would wait forever for an answer.
+    //
+    // A real one means xdg-desktop-portal (org.freedesktop.portal.FileChooser)
+    // over D-Bus, which is the only way a sandboxed Wayland client can show a
+    // file dialog at all — a dependency worth adding deliberately, not as a
+    // side effect of this commit.
+    void pickDirectory(std::function<void(const std::string&)> cb) override {
+        if (cb) cb("");
+    }
+
     // ── InputSink (framework/vk_canvas/core/input.hh) ──────────────────────
     void onPointer(const PointerEvent& e) override {
         switch (e.action) {
@@ -226,6 +272,12 @@ public:
             }
             break;
         case PointerAction::Up:
+            // The plain release goes out FIRST, and unconditionally: an
+            // immediate-mode app needs the up edge even for a tap that never
+            // moved, and even when the drag bookkeeping below decides the
+            // stroke meant nothing.
+            if (e.button == 0)
+                owner_->onLButtonUp((int)e.x, (int)e.y);
             // A drag that has ended. The 4 px is only "the pointer actually
             // moved" — whether the stroke was long enough to MEAN anything is
             // the app's question, not this file's (PlayerWindow::onDragEnd).
@@ -254,7 +306,7 @@ public:
 
     void onKey(const KeyEvent& e) override {
         if (e.keyCode == key::Alt) { altHeld_ = e.down; return; }
-        if (!e.down) return;
+        if (!e.down) { owner_->onKeyUpPortable(e.keyCode); return; }
 
         // Alt+<key>: Windows delivers these as system-wide RegisterHotKey
         // WM_HOTKEY messages; Wayland has no cross-compositor equivalent, so

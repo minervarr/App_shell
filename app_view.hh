@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
+#include <string>
 
 // ── What a Host talks to ─────────────────────────────────────────────────────
 //
@@ -43,7 +45,31 @@ public:
     // Keyboard, in the portable key::* space (vk_canvas's keys.hh), never in
     // the platform's own keycodes.
     virtual void onKeyDownPortable(int keyCode) {}
+    // The release, for the same reason onLButtonUp exists: a HELD modifier is
+    // not expressible as a stream of down edges. "Was Ctrl down at the moment
+    // C's edge arrived?" needs both ends, and every host already has them —
+    // InputSink::onKey carries a `down` flag the hosts currently drop.
+    virtual void onKeyUpPortable(int keyCode) {}
     virtual void onCharPortable(uint32_t codepoint) {}
+
+    // A platform INPUT METHOD replaced the focused field's whole contents.
+    //
+    // Not a variant of onCharPortable, and it cannot be expressed as one:
+    // composing Korean jamo into a syllable, or choosing a Chinese candidate
+    // over its pinyin reading, REWRITES the pending run — the text on screen a
+    // moment ago is not a prefix of the text that follows. A stream of "a
+    // character was typed" has nowhere to put that.
+    //
+    // So the platform states the field's authoritative contents and the app
+    // adopts them wholesale, which also leaves composition state owned by the
+    // IME — the only place it can correctly live, since reconstructing it here
+    // would be writing an IME. `cursorByte` is a byte offset into `text`, not
+    // a character index, because that is what a UTF-8 buffer can act on
+    // without re-scanning.
+    //
+    // Desktop backends never emit this: Win32 WM_CHAR and Wayland's xkb path
+    // both produce finished characters and keep using onCharPortable.
+    virtual void onTextEditPortable(const std::string& text, size_t cursorByte) {}
     // A system-wide or focused-window hotkey the host registered on the app's
     // behalf. The IDs are the application's own vocabulary; the host only
     // carries them back.
@@ -73,6 +99,19 @@ public:
     virtual void onMouseMove(int x, int y) {}
     virtual void onMouseLeave() {}
     virtual void onLButtonDown(int x, int y) {}
+    // The release. Every host already sees it — that is where onDragEnd below
+    // is computed from — but until now none forwarded it, because a retained
+    // UI that hit-tests on press has no use for it.
+    //
+    // An IMMEDIATE-MODE app does: a slider, a scrollbar and a press-and-cancel
+    // button are all "is the button still held, and did it just go up this
+    // frame?", and that question cannot be answered from a down edge and a
+    // drag summary. See frame_input_view.hh, which turns this back into
+    // FrameInput::pointerWentUp.
+    //
+    // Fires on every release, including a tap that never moved — unlike
+    // onDragEnd, which is deliberately silent below the host's slop.
+    virtual void onLButtonUp(int x, int y) {}
     virtual void onLButtonDblClk(int x, int y) {}
     virtual void onMouseWheel(int x, int y, int delta) {}
 

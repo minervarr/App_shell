@@ -75,24 +75,82 @@ app_shell/
   host.hh            — what the app calls. A platform implements it.
   app_main.hh        — app_shell_main(), plus the three names an app supplies
   app_paths.hh/.cc   — exeDir() / stateDir(), and the rule about the split
+  frame_input_view.hh— an AppView for an IMMEDIATE-MODE app (see below)
   ui_metrics.hh/.cc  — one scale factor, five type roles, space()/stroke()
   ui_orientation.*   — Horizontal or Vertical, derived from the window's shape
+  utf16_utf8.hh/.cc  — real UTF-8 <-> UTF-16, because JNI's converters are not
   layout_rect.hh     — a portable rectangle (replaces Win32's RECT)
   color.hh           — a portable colour (replaces COLORREF)
   os/
     win32_host.cc          — real Win32 window + message pump + minidump
     wayland_host.cc        — real Wayland, via vk_canvas's WaylandDisplay/Window
     android_host.hh/.cc    — real ALooper/ANativeWindow host
+    activity_bridge.*      — the C++ end of AppShellActivity (IME, clipboard, URL)
     app_paths_android.*    — Android's answer to exeDir()/stateDir()
     launch_intent.*        — read a string extra off the launch intent
-    safe_area.*            — the display CUTOUT (never a system bar)
+    safe_area.*            — the display CUTOUT (never a system bar, never the IME)
     storage_permission.*   — all-files access, asked at most once
+  platform/android/java/io/nava/appshell/AppShellActivity.java
+                     — the ONLY Java here. Text input needs it; nothing else does.
   tests/             — plain assert(), Debug-only, no framework
   cmake/AppShellMinTextSize.cmake — the build-time text-size floor generator
 ```
 
 `app_shell` (portable) links nothing. `app_shell_win32` / `app_shell_wayland` /
 `app_shell_android` are one host each, and a consumer links exactly one.
+
+### Two input styles, one Host
+
+`Host` speaks in callbacks — "the left button went down at 40,12". An
+**immediate-mode** UI asks the opposite question while it draws: "is the pointer
+in this rect AND did it go down this frame?" Both are legitimate, and which one
+an app wants is not a platform question — so it is not baked into `Host`.
+
+`frame_input_view.hh` is the adapter: an `AppView` that pours the callbacks into
+vk_canvas's `FrameInput` (which is itself an `InputSink`, so the conversion is
+the one the engine already ships). An app that inherits from it reads
+`input().pointerWentDown` and gets every widget in vk_canvas's `widgets.hh` for
+free. Matrix Player does **not** use it — it hit-tests on the callbacks directly
+and contains no `FrameInput` anywhere.
+
+That adapter is why `AppView` has `onLButtonUp` and `onKeyUpPortable`. Every host
+already saw both — the up is where `onDragEnd` is computed from, and `KeyEvent`
+carries a `down` flag — but none forwarded them, because a retained UI that
+hit-tests on press never needs them. A slider, a scrollbar and a held Ctrl all do.
+
+### The Java half, and why there is exactly one file of it
+
+Everything else on Android is C++ reaching the system through JNI. Text input
+cannot be: `NativeActivity` delivers keycodes, and an input method is not a
+sequence of keystrokes — Korean assembles jamo into syllables, Chinese picks
+candidates over a reading, dictation produces no keys at all. Reconstructing
+that natively means writing an IME.
+
+So `AppShellActivity` holds an off-screen `EditText`, lets Android's IME edit it,
+and mirrors the whole buffer down through `AppView::onTextEditPortable(text,
+cursorByte)` — the field's authoritative contents, not a delta, because the text
+on screen a moment ago is not a prefix of what follows.
+
+A consumer **subclasses it and must add its own `System.loadLibrary` static
+block** — that cannot live here, since only the consumer knows the library name,
+and without it every `native` method throws `UnsatisfiedLinkError` even though
+the library is already mapped (NativeActivity `dlopen()`s it from native code,
+which never registers it with the JVM). Gradle needs
+`sourceSets.main.java.srcDirs += '<app_shell>/platform/android/java'`. The JNI
+symbols encode the DECLARING class, so they resolve for any subclass.
+
+### Keyboard inset is not a safe inset
+
+`safeInsets()` is the display cutout. `keyboardInset()` is the on-screen
+keyboard. They are never summed and never share a field, because a cutout is
+glass — permanent, hardware, unremovable — and a keyboard is software that comes
+and goes and only ever eats the bottom edge. Merging them gives a choice of two
+bugs: a permanent dead strip once the keyboard has been up, or a camera notch
+that stops being avoided the moment it goes down.
+
+The cutout is read natively (`os/safe_area.cc`); only the keyboard height comes
+through Java. Reporting the cutout through both would give one number two
+sources that can disagree.
 
 ---
 
@@ -206,9 +264,13 @@ so a test can never quietly start depending on Vulkan.
 ```bash
 ./build/<tree>/app_shell_build/ui_metrics_test
 ./build/<tree>/app_shell_build/ui_orientation_test
+./build/<tree>/app_shell_build/utf16_utf8_test
 ```
 
-Keep them pure.
+Keep them pure. `utf16_utf8` is deliberately written over `uint16_t` rather than
+`jchar` so this last one compiles on a desktop with no NDK in sight — which
+matters more than it sounds, because the surrogate-pair cases it covers are
+unreachable from any desktop run and would otherwise never be exercised at all.
 
 ---
 

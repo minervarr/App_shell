@@ -4,6 +4,8 @@
 #include <string>
 #include <memory>
 #include <cstdint>
+#include <cstddef>
+#include <functional>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -203,6 +205,67 @@ public:
     // decided in AppView::onHostReady(); this is the seam that replaced
     // AndroidHost calling the music player's own commitAddFolder().
     virtual std::string launchArgument() const { return {}; }
+
+    // ── Services a platform offers, that an app cannot fake ─────────────────
+    //
+    // All defaulted rather than pure, and the defaults are honest refusals
+    // rather than silent no-ops where a caller could tell the difference: a
+    // host that has not implemented one must not make the app believe it did.
+    // Each is here rather than in the app because only the platform can answer
+    // it, and each passes the test this library applies to everything —
+    // a drawing program would want every one of them.
+
+    // Raise or dismiss the on-screen keyboard.
+    //
+    // `text`/`cursorByte` SEED the platform's own edit buffer, and that is the
+    // whole subtlety: while an input method is composing, the platform owns the
+    // field's contents (see AppView::onTextEditPortable), so it has to be told
+    // what is already there or the first composed syllable replaces the text
+    // the user typed before it.
+    //
+    // No-ops on a desktop, where a physical keyboard is always present and
+    // there is nothing to raise. That is not a stub — it is the honest answer.
+    virtual void showKeyboard(const std::string& text, size_t cursorByte) {}
+    virtual void hideKeyboard() {}
+
+    // How much of the bottom of OUR window the on-screen keyboard is currently
+    // covering, in pixels. Zero when it is down, and always zero on a desktop.
+    //
+    // Deliberately NOT part of safeInsets(). A cutout is glass: permanent,
+    // hardware, and the same on every frame. A keyboard is software, comes and
+    // goes, and only ever eats the bottom edge. Folding the two together means
+    // either a permanent dead strip once the keyboard has been up, or a cutout
+    // that stops being avoided when it goes down — both were observed before
+    // they were separated.
+    virtual int keyboardInset() const { return 0; }
+
+    // System clipboard, text only.
+    //
+    // getClipboardText() is synchronous and may block BRIEFLY: on Wayland a
+    // paste is a real round trip to whichever client owns the selection. That
+    // is acceptable because paste is user-triggered and rare; nothing on a
+    // frame path may call it. Returns "" when the clipboard is empty, holds
+    // something that is not text, or the host cannot do this yet.
+    virtual void setClipboardText(const std::string& utf8) {}
+    virtual std::string getClipboardText() { return {}; }
+
+    // Open `url` in whatever the user has chosen as their browser.
+    // Fire-and-forget: nothing here can observe what the browser then does.
+    // False means this host has no launcher at all, so the caller can offer
+    // the URL as text to copy instead of appearing to have done nothing.
+    virtual bool openUrl(const std::string& url) { return false; }
+
+    // Native directory picker. `cb` receives the chosen absolute path, or ""
+    // if the user cancelled.
+    //
+    // A CALLBACK rather than a return value because the platforms genuinely
+    // differ in kind and neither can be made to look like the other: a Win32
+    // picker is a modal that returns when it closes, while Android's is a
+    // separate activity whose answer arrives on a later trip through the pump.
+    // Callers must therefore not assume `cb` runs before the current frame
+    // ends — nor that it runs at all, since an unimplemented host never calls
+    // it.
+    virtual void pickDirectory(std::function<void(const std::string&)> cb) {}
 
     // One iteration of the platform's message/event pump. Blocks up to
     // ~timeoutMs if haveWork is false, else processes what's ready and
