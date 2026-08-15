@@ -1,0 +1,4 @@
+/home/nava/Files/code/active/streamer/framework/app_shell/build/CMakeFiles/app_shell.dir
+/home/nava/Files/code/active/streamer/framework/app_shell/build/CMakeFiles/app_shell_android.dir
+/home/nava/Files/code/active/streamer/framework/app_shell/build/CMakeFiles/edit_cache.dir
+/home/nava/Files/code/active/streamer/framework/app_shell/build/CMakeFiles/rebuild_cache.dir
