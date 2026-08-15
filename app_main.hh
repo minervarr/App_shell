@@ -8,13 +8,24 @@
 // When that is done, the bootstrap calls this, and the application takes over.
 //
 // The app DEFINES it; app_shell only declares and calls it. Deliberately a
-// plain free function with no arguments rather than a class to derive from:
-// argv is already parsed by the platform on two of the three targets, and an
-// app that wants it can read it the way it always could.
+// plain free function rather than a class to derive from — the app already has
+// its own shape, and inheritance here would only dictate one.
 //
-// Android has no equivalent and needs none — android_main() is the entry point
-// there, and it constructs the app and the AndroidHost directly.
-int app_shell_main();
+// It TAKES argc/argv, which it did not at first. The Wayland bootstrap was a
+// bare `int main()`, so the command line was simply unreachable from an app
+// built on this — and the first consumer worked around it by reading
+// environment variables instead, which is a worse command line that no `--help`
+// can describe. On Windows they come from __argc/__argv, since WinMain is
+// handed an unparsed LPSTR.
+//
+// An app that wants neither ignores both parameters; nothing here requires an
+// app to have a command line.
+//
+// Android passes argc=0 and argv=nullptr: an app started by an Intent has no
+// command line at all, and what it was launched WITH arrives through
+// Host::launchArgument() instead. android_main() is the entry point there, and
+// it constructs the app and the AndroidHost directly.
+int app_shell_main(int argc, char** argv);
 
 // ── The two strings an application gives its shell ──────────────────────────
 //

@@ -385,6 +385,19 @@ void crashHandler(int sig) {
 }
 
 void openLogFile() {
+    // Only when there is no terminal to print to.
+    //
+    // A log file is the right answer for a program launched from a desktop
+    // icon, where stdout goes nowhere and a diagnostic that is not written down
+    // is lost. It is the WRONG answer when someone ran the binary in a shell:
+    // they are looking at the terminal, and silently redirecting means every
+    // message they asked for lands in a file they were not told about. Measured
+    // the obvious way — `streamer_gui --selftest` printed nothing at all.
+    //
+    // isatty() answers exactly the question that distinguishes the two, and it
+    // stays right under a pipe or a redirect, where the caller has already said
+    // where output should go.
+    if (isatty(fileno(stdout))) return;
     // app_paths::stateDir() (not the exe's own directory) so a read-only
     // install still gets a log — see app_paths.hh. Identical to the old path
     // unless MATRIX_STATE_HOME was defined at build time. This is the FIRST
@@ -407,10 +420,10 @@ void openLogFile() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     openLogFile();
     signal(SIGSEGV, crashHandler);
     signal(SIGABRT, crashHandler);
 
-    return app_shell_main();
+    return app_shell_main(argc, argv);
 }

@@ -35,7 +35,12 @@ function(app_shell_generate_min_text_size)
     endif()
 
     ExternalProject_Add(min_text_size_ext
-        SOURCE_DIR ${APP_SHELL_DIR}/../vk_canvas/first_party/vulkan_font_engine/tools/min_text_size
+        # VK_CANVAS_DIR, not a hardcoded ../vk_canvas. The sibling directory's
+        # NAME is the consumer's choice — streamer clones the same repository as
+        # Vk_Canvas_Lb_LAW — and the cache variable is the seam that already
+        # exists for saying so. Hardcoding it here made this recipe configure
+        # for exactly one consumer.
+        SOURCE_DIR ${VK_CANVAS_DIR}/first_party/vulkan_font_engine/tools/min_text_size
         CMAKE_ARGS
             -G${CMAKE_GENERATOR}
             -DCMAKE_BUILD_TYPE=Release

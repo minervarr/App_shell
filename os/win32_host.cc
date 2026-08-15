@@ -667,7 +667,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     timeBeginPeriod(1);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    int rc = app_shell_main();
+    // __argc/__argv rather than the LPSTR above: WinMain is handed the command
+    // line UNPARSED and without argv[0], while the CRT has already done the
+    // splitting for its own main(). Using it means an app sees exactly the same
+    // argc/argv shape on all three platforms.
+    int rc = app_shell_main(__argc, __argv);
 
     CoUninitialize();
     timeEndPeriod(1);
