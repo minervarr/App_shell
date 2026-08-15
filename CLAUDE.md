@@ -54,11 +54,16 @@ consumer. **API-shaping decisions should favour the NEXT consumer, not that
 one** — that is the whole reason this is a separate library rather than a folder
 in `gui/`.
 
-It lives IN that repository as a plain directory, not as a submodule. The split
-that matters is the one in the source (nothing here may know what a track is),
-not one in version control: this is first-party, it changes in step with the app
-that consumes it, and a fourth clone step would buy nothing. A second app either
-copies the folder or points its own `add_subdirectory()` at this one.
+It is its own repository (github.com/minervarr/App_shell), added as a git
+submodule at `framework/app_shell` by every consumer — the same shape
+`audio_engine` and `vk_canvas` already use. A second app adds it the same way:
+`git submodule add https://github.com/minervarr/App_shell.git framework/app_shell`,
+then `add_subdirectory()`s it and links `app_shell` plus the one platform host it
+needs. The split that matters is still the one in the SOURCE, never in version
+control: nothing in here may know what a track is, regardless of how it is
+cloned. This repository is committed and pushed with its own `git_wrapper` —
+never plain `git commit`/`git push` — from inside `framework/app_shell/`; the
+consumer's own `git_wrapper push` pushes this submodule first, then itself.
 
 ---
 
@@ -209,5 +214,8 @@ Keep them pure.
 
 ## Committing
 
-Use `git_wrapper` at the CONSUMING repository's root, never plain `git commit`/
-`git push`. There is no separate repository here to push.
+Use `./git_wrapper` from inside `framework/app_shell/`, never plain
+`git commit`/`git push` — this is its own repository. Commit and push here
+FIRST, then commit and push the consumer (its own `git_wrapper push` already
+pushes submodules before itself, but doing it by hand in the right order is
+the same rule vk_canvas and audio_engine follow).
