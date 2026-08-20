@@ -101,6 +101,10 @@ public:
 
     void showErrorMessage(const std::string& title, const std::string& msg) override;
 
+    JavaVM* javaVm() const override { return state_ ? state_->activity->vm : nullptr; }
+    void*   activityObject() const override { return state_ ? state_->activity->clazz : nullptr; }
+    void*   nativeApp() const override { return state_; }
+
 private:
     struct Event { int id; intptr_t p1, p2; };
 
@@ -111,6 +115,7 @@ private:
     void onWindowTerm();
     void onGainedFocus();
     void onResume();
+    void onPause();
 
     void dispatchAppEvent(const Event& e);
     void drainEvents();

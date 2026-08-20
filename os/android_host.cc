@@ -306,6 +306,7 @@ void AndroidHost::handleAppCmd(android_app* app, int32_t cmd) {
         case APP_CMD_TERM_WINDOW:   self->onWindowTerm();  break;
         case APP_CMD_GAINED_FOCUS:  self->onGainedFocus(); break;
         case APP_CMD_RESUME:        self->onResume();      break;
+        case APP_CMD_PAUSE:         self->onPause();       break;
         case APP_CMD_WINDOW_RESIZED:
         case APP_CMD_CONFIG_CHANGED:
             // A rotation arrives here as an ordinary resize, which is exactly
@@ -378,6 +379,11 @@ void AndroidHost::onResume() {
     // storage answer can have changed, and it is the moment
     // storage_permission.hh's own comment says to re-check on.
     maybeSignalHostReady();
+    if (appReady_ && owner_) owner_->onAppForegrounded();
+}
+
+void AndroidHost::onPause() {
+    if (appReady_ && owner_) owner_->onAppBackgrounded();
 }
 
 // ── Storage permission, asked at most once ───────────────────────────────────
