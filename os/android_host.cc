@@ -496,9 +496,19 @@ void AndroidHost::onTouchMove(float x, float y) {
     // Past the slop the gesture belongs to scrolling, for good. The wheel is
     // fed the finger's own displacement since the last event, so content
     // tracks the finger rather than stepping.
-    const int delta = (int)std::lround((y - touchLastY_) * kWheelPerPixel);
-    touchLastY_ = y;
-    if (delta != 0) owner_->onMouseWheel((int)x, (int)y, delta);
+    //
+    // Only the whole units actually delivered are consumed: advancing the
+    // anchor to `y` would round away everything below one unit, and a slow
+    // deliberate drag is made of exactly those fractions — it would travel a
+    // visibly shorter distance than a fast drag across the same pixels. Keeping
+    // the remainder makes the gesture's total displacement independent of how
+    // fast the finger moved and of the event rate.
+    const float moved = (y - touchLastY_) * kWheelPerPixel;
+    const int   delta = (int)std::trunc(moved);
+    if (delta != 0) {
+        touchLastY_ += (float)delta / kWheelPerPixel;
+        owner_->onMouseWheel((int)x, (int)y, delta);
+    }
 }
 
 void AndroidHost::onTouchUp(float x, float y, bool cancelled) {
