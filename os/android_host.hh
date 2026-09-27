@@ -68,6 +68,7 @@ public:
 
     void showWindow() override {}
     MonitorInfo primaryMonitor() const override;
+    float       displayDpi() const override;
     // The display cutout, and ONLY the cutout — see the definition. The system
     // bars are hidden rather than avoided, so they contribute nothing here.
     SafeInsets safeInsets() const override;
@@ -89,6 +90,7 @@ public:
     // why every helper there clears the pending exception.
     void showKeyboard(const std::string& text, size_t cursorByte) override;
     void hideKeyboard() override;
+    bool inputIsTouch() const override { return true; }
     int  keyboardInset() const override { return imeBottom_; }
 
     void setClipboardText(const std::string& utf8) override;
@@ -105,6 +107,15 @@ public:
     void*   activityObject() const override { return state_ ? state_->activity->clazz : nullptr; }
     void*   nativeApp() const override { return state_; }
 
+    // The NativeActivity handle this host was built on.
+    //
+    // Exposed because the launch-intent helpers (launch_intent.hh) are free
+    // functions that need it, and an app that wants to read its OWN intent —
+    // a viewer opened on a document, say — otherwise has to thread that
+    // pointer down from android_main() in parallel with the Host it already
+    // owns. Read-only: nothing outside this class may drive the looper.
+    android_app* androidApp() const { return state_; }
+
 private:
     struct Event { int id; intptr_t p1, p2; };
 
@@ -114,6 +125,7 @@ private:
     void onWindowInit();
     void onWindowTerm();
     void onGainedFocus();
+    void onLostFocus();
     void onResume();
     void onPause();
 
@@ -125,9 +137,10 @@ private:
     //
     // A finger is not a mouse, and the difference is not cosmetic: a drag must
     // scroll and must NOT press whatever was under it when it started. Below
-    // the slop the gesture is a tap and arrives as onMouseMove + a click at
-    // release; past the slop it becomes wheel deltas and the click is
-    // cancelled for good, even if the finger comes back.
+    // the slop the gesture is a tap (press at contact, completes at release);
+    // past the slop it becomes wheel deltas 1:1 and the press is cancelled
+    // for good, even if the finger comes back. A lift is a stop; there is no
+    // fling.
     void onTouchDown(float x, float y);
     void onTouchMove(float x, float y);
     void onTouchUp(float x, float y, bool cancelled);
@@ -181,6 +194,10 @@ private:
     // Touch state (one finger; this app has no pinch or two-finger gesture).
     float touchStartX_ = 0.0f, touchStartY_ = 0.0f;
     float touchLastY_  = 0.0f;
+    // Sub-pixel carry for the drag. Without it a drag slower than one pixel
+    // per sample rounds to nothing and the content does not move -- see
+    // onTouchMove().
+    float dragRemainder_ = 0.0f;
     bool  touchDragging_ = false;
     bool  touchDown_     = false;
     std::chrono::steady_clock::time_point lastTapTime_;

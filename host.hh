@@ -157,6 +157,20 @@ public:
 
     virtual MonitorInfo primaryMonitor() const = 0;
 
+    // How many pixels there are to an inch on the display this window is on,
+    // or 0 when the platform will not say.
+    //
+    // The distinction from every other size in this header is that this one is
+    // a MEASUREMENT rather than a preference. A compositor scale factor and a
+    // UiScale both answer "how big should things look"; neither answers "how
+    // big is a pixel", and a UI that wants a margin to be the same physical
+    // size on a phone and on a monitor needs the second question.
+    //
+    // Zero is a real answer — a nested or headless compositor has no physical
+    // output to report — so a caller must carry a fallback rather than treat
+    // it as an error.
+    virtual float displayDpi() const { return 0.0f; }
+
     // See SafeInsets. Defaulted rather than pure so the two desktop hosts and
     // the headless one need no implementation at all: a window they are given
     // is a window they own, and the honest answer is zero on every edge.
@@ -198,10 +212,11 @@ public:
     // shape already showing, so callers need not track it themselves.
     virtual void setCursor(CursorShape shape) = 0;
 
-    // Hold the display awake (fullscreen artwork). SetThreadExecutionState on
-    // Windows; a Wayland idle inhibitor on Linux, which needs the compositor
-    // to expose zwp_idle_inhibit_manager_v1 — a no-op where it doesn't, since
-    // nothing else can ask.
+    // Hold the display awake (fullscreen artwork, a long background job).
+    // SetThreadExecutionState on Windows; a Wayland idle inhibitor on Linux,
+    // which needs the compositor to expose zwp_idle_inhibit_manager_v1 — a
+    // no-op where it doesn't, since nothing else can ask. Android sets
+    // FLAG_KEEP_SCREEN_ON on the activity window.
     virtual void setKeepAwake(bool on) = 0;
 
     // Cross-thread wakeup: safe to call from any thread. The three integers
@@ -243,6 +258,22 @@ public:
     // there is nothing to raise. That is not a stub — it is the honest answer.
     virtual void showKeyboard(const std::string& text, size_t cursorByte) {}
     virtual void hideKeyboard() {}
+
+    // Whether this host's pointer is a FINGER rather than a mouse.
+    //
+    // Asked because the two disagree about what a scroll delta means, and the
+    // disagreement is not a bug to be normalised away. A wheel notch is an
+    // abstract step whose traditional sense is "away from me scrolls up"; a
+    // finger is direct manipulation, where the content is expected to follow
+    // it. A host reports its own convention faithfully -- Android sends the
+    // finger's own displacement, the desktops send +/-120 per notch -- and an
+    // app that offers a "reverse scrolling" preference therefore needs TWO of
+    // them, because one flag applied to both necessarily gets one wrong.
+    //
+    // A property of the host, not of the moment: a device with both a
+    // touchscreen and a mouse would need this per event, and none of the three
+    // hosts here is one. Stated as the honest narrowing rather than faked.
+    virtual bool inputIsTouch() const { return false; }
 
     // How much of the bottom of OUR window the on-screen keyboard is currently
     // covering, in pixels. Zero when it is down, and always zero on a desktop.

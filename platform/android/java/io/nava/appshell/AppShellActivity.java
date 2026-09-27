@@ -3,12 +3,21 @@ package io.nava.appshell;
 import android.app.NativeActivity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
+import android.hardware.display.DisplayManager;
 import android.net.Uri;
+import android.provider.MediaStore;
+import android.media.MediaScannerConnection;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -117,6 +126,8 @@ public class AppShellActivity extends NativeActivity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+
+        maybeRequestHdrColorMode();
 
         // Keep our own surface from being resized or panned when the IME opens.
         // The app draws its own layout and moves the focused field itself,
@@ -227,6 +238,222 @@ public class AppShellActivity extends NativeActivity {
     }
 
     /**
+     * Name of the {@code <meta-data>} an app sets to ask for an HDR window.
+     *
+     * <pre>{@code
+     * <meta-data android:name="io.nava.appshell.HDR" android:value="true" />
+     * }</pre>
+     */
+    private static final String HDR_META = "io.nava.appshell.HDR";
+
+    private static final String TAG = "AppShell";
+
+    /**
+     * Asks the window manager for an HDR colour mode, if — and only if — the
+     * consumer opted in through the manifest.
+     *
+     * <p><strong>Opt-in, never inferred.</strong> An HDR window is not free:
+     * on many devices it forces the panel into a different, more
+     * power-hungry mode for as long as it is up, and an app whose content is
+     * ordinary SDR gains nothing for that cost. So the default is off and
+     * stays off, and every existing consumer of this library sees no change
+     * whatsoever.
+     *
+     * <p><strong>This must happen in {@code onCreate}</strong>, before the
+     * NativeActivity's surface exists. The colour mode is a property of the
+     * window, and the set of {@code VkSurfaceFormatKHR} pairs a driver
+     * enumerates for a surface can depend on it — asking afterwards means the
+     * native side has already chosen a format from a list that did not
+     * include the HDR ones.
+     *
+     * <p>This is a request, not a guarantee. {@code setColorMode} is silent
+     * about refusal, and a device may honour it, ignore it, or honour it only
+     * while the app is in the foreground. Nothing here reports success;
+     * native code must ask the surface what it actually got rather than
+     * assume this worked.
+     */
+    private void maybeRequestHdrColorMode() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        try {
+            Bundle meta = getPackageManager().getActivityInfo(
+                    getComponentName(), PackageManager.GET_META_DATA).metaData;
+            if (meta == null || !meta.getBoolean(HDR_META, false)) {
+                Log.i(TAG, "HDR colour mode NOT requested (no " + HDR_META + " meta-data)");
+                return;
+            }
+            getWindow().setColorMode(ActivityInfo.COLOR_MODE_HDR);
+            // Logged because it is otherwise UNOBSERVABLE. setColorMode returns
+            // nothing and reports no refusal, so without this line there is no
+            // way to tell "we never asked" from "we asked and were ignored" --
+            // and those want opposite fixes.
+            Log.i(TAG, "HDR colour mode requested (COLOR_MODE_HDR)");
+        } catch (Exception e) {
+            // A missing entry, a renamed component, an OEM that throws from
+            // setColorMode: all mean "no HDR window", which is a state the
+            // native side already has to handle because the request can be
+            // refused silently anyway.
+        }
+    }
+
+    /**
+     * The display this activity is on, without touching the view hierarchy.
+     *
+     * <p>Deliberately NOT {@code getWindow().getDecorView().getDisplay()}:
+     * every caller here arrives on the native app thread, not the UI thread,
+     * and {@code getDecorView()} instantiates the decor view if it does not
+     * exist yet — a UI-thread operation. It happens to be there by the time
+     * native code asks, which makes the bug a race rather than a crash, and
+     * that is worse. {@link DisplayManager} is thread-safe by contract.
+     */
+    private Display activityDisplay() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Display d = getDisplay();          // the display we are actually on
+            if (d != null) return d;
+        }
+        DisplayManager dm = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        return dm == null ? null : dm.getDisplay(Display.DEFAULT_DISPLAY);
+    }
+
+    /**
+     * How far above SDR white this display can currently go, as a multiplier —
+     * {@code 1.0} means no headroom at all (an SDR panel, or one that will not
+     * say).
+     *
+     * <p>Native code needs this and cannot get it: none of this has an NDK
+     * equivalent, and the alternative is to hardcode a number and call it
+     * headroom. A tone curve rolling highlights toward a guessed peak either
+     * crushes detail the panel could have shown or pushes past what it can,
+     * and both look like a bad photograph rather than a bad constant.
+     *
+     * <p><strong>CURRENTLY, not permanently.</strong> On API 34+ this is
+     * {@link Display#getHdrSdrRatio()}, which is a live measurement and moves
+     * with the brightness slider — SDR white is whatever the system is
+     * presently driving it at, so the same panel has a lot of headroom in a
+     * dark room and almost none outdoors. A caller that reads this once and
+     * keeps it will drift; re-read it when the surface comes back.
+     *
+     * <p>The pre-34 fallback is {@code desiredMaxLuminance / 203} — the
+     * panel's static capability over BT.2408 graphics white. That is an
+     * approximation of the same quantity and it is the reason the ratio API
+     * is preferred: it assumes SDR white sits at 203 nits, which is exactly
+     * the assumption the ratio API exists to stop making. DESIRED rather than
+     * maximum luminance, because the maximum is a peak the panel sustains
+     * over a small window only, and mapping a whole image to it is how HDR
+     * gets a reputation for being painful to look at.
+     *
+     * <p>Clamped to at least {@code 1.0} so a caller can multiply by it
+     * unconditionally, and never throws — an unknown display reports no
+     * headroom rather than an error.
+     */
+    /**
+     * Pixels per inch of the display this activity is on, or 0 when it cannot
+     * be determined.
+     *
+     * <p>{@code xdpi} is the panel's real horizontal density, which is the
+     * measurement wanted here — NOT {@code densityDpi}, which is quantised to
+     * a bucket (160/240/320/...) and is a scaling preference. A margin
+     * authored in millimetres against the bucket would come out a different
+     * size on two phones that round to the same one.
+     *
+     * <p>Never throws: an unknown display reports 0 rather than an error, and
+     * the native side has a fallback either way.
+     */
+    @SuppressWarnings("unused")
+    public float displayDpi() {
+        try {
+            android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+            Display d = activityDisplay();
+            if (d == null) return 0.0f;
+            d.getMetrics(dm);
+            // xdpi is occasionally nonsense on cheap devices (0, or wildly
+            // large); fall back to the bucket rather than return a number that
+            // would put a 3 mm margin off the edge of the screen.
+            if (dm.xdpi > 40.0f && dm.xdpi < 1200.0f) return dm.xdpi;
+            if (dm.densityDpi > 0) return (float) dm.densityDpi;
+            return 0.0f;
+        } catch (Throwable t) {
+            Log.i(TAG, "displayDpi unavailable: " + t);
+            return 0.0f;
+        }
+    }
+
+    @SuppressWarnings({"unused", "deprecation"})
+    public float displayHdrHeadroom() {
+        try {
+            Display d = activityDisplay();
+            if (d == null) return 1.0f;
+
+            // API 34+: the display reports the ratio itself, live.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+                    && d.isHdrSdrRatioAvailable()) {
+                float r = d.getHdrSdrRatio();
+                if (!Float.isNaN(r)) {
+                    // A valid answer of exactly 1.0 means "no headroom right
+                    // now", which is a real state (SDR mode, or the brightness
+                    // already at the top), not a failure to answer.
+                    float live = r > 1.0f ? r : 1.0f;
+                    Log.i(TAG, "headroom " + live + "x from getHdrSdrRatio (live)");
+                    return live;
+                }
+            }
+
+            Display.HdrCapabilities caps = d.getHdrCapabilities();
+            if (caps == null) return 1.0f;
+            float desired = caps.getDesiredMaxLuminance();
+            if (Float.isNaN(desired) || desired <= 0.0f) return 1.0f;
+            float headroom = desired / 203.0f;
+            if (headroom < 1.0f) headroom = 1.0f;
+            // Which source answered matters when the number looks wrong: the
+            // static one cannot track brightness and will read high in daylight.
+            Log.i(TAG, "headroom " + headroom + "x from desiredMaxLuminance="
+                    + desired + " (static fallback; ratio API unavailable)");
+            return headroom;
+        } catch (Exception e) {
+            return 1.0f;
+        }
+    }
+
+    /**
+     * Ask the system to hold this activity at a particular orientation.
+     *
+     * <p>{@code mode} is an {@link ActivityInfo} {@code SCREEN_ORIENTATION_*}
+     * constant, passed through unchanged — the caller is native code that
+     * already knows which one it wants, and translating an enum here would
+     * only mean maintaining the same table twice.
+     * {@code SCREEN_ORIENTATION_UNSPECIFIED} (-1) hands control back to the
+     * user's own rotation setting, which is what an app should do when it has
+     * no opinion.
+     *
+     * <p>A REQUEST. The system may decline it — a foldable's outer display, a
+     * freeform or split-screen window, or a device policy can all override
+     * what an activity asks for — so nothing may depend on it having taken
+     * effect. It is also why this returns nothing: the honest answer arrives
+     * later, as a configuration change, and the caller sees it as a resize
+     * like any other.
+     *
+     * <p>Marshalled to the UI thread. {@code setRequestedOrientation} is not
+     * safe to call from the native app thread, and the caller here is a native
+     * up-call that always is on it.
+     */
+    @SuppressWarnings("unused")
+    public void requestOrientation(final int mode) {
+        try {
+            runOnUiThread(new Runnable() {
+                @Override public void run() {
+                    try {
+                        setRequestedOrientation(mode);
+                    } catch (Exception e) {
+                        Log.w(TAG, "setRequestedOrientation(" + mode + ") refused", e);
+                    }
+                }
+            });
+        } catch (Exception e) {
+            // An activity already finishing has no live UI thread to post to.
+            Log.w(TAG, "requestOrientation(" + mode + ") could not be posted", e);
+        }
+    }
+
+    /**
      * Root of SHARED storage, e.g. {@code /storage/emulated/0} — a real
      * filesystem path, not a SAF tree URI.
      *
@@ -243,6 +470,198 @@ public class AppShellActivity extends NativeActivity {
     @SuppressWarnings("unused")
     public String externalStorageRoot() {
         return android.os.Environment.getExternalStorageDirectory().getAbsolutePath();
+    }
+
+    /**
+     * Publish an image into the user's shared Pictures collection, and return
+     * the {@code content://} URI it landed at (or {@code null} on failure).
+     *
+     * <p>This exists because under scoped storage there is NO path-based way to
+     * do it. From API 29 an app may not create files in a shared collection with
+     * ordinary filesystem calls, however correct the path looks: the write fails
+     * and the only supported route is a {@link android.content.ContentResolver}
+     * insert into {@link MediaStore}. That is Java-only, which is why a native
+     * app that merely wants to save a picture has to come up here to do it.
+     *
+     * <p>The consequence of getting this wrong is not a crash — it is a file
+     * written somewhere the user will never look for it.
+     *
+     * <p>{@code relativeDir} is a sub-path under Pictures, e.g. "ViewMage".
+     * IS_PENDING hides the row until the bytes are all written, so a gallery
+     * scanning mid-write never shows a torn image.
+     *
+     * <p>Below API 29 there is no RELATIVE_PATH and no IS_PENDING; the file is
+     * written directly (legal there, with WRITE_EXTERNAL_STORAGE) and the media
+     * scanner is told about it, which is what makes it appear in the gallery.
+     */
+    @SuppressWarnings("unused")
+    public String publishImage(String displayName, String mimeType,
+                               String relativeDir, byte[] data) {
+        if (displayName == null || data == null || data.length == 0) return null;
+        if (mimeType == null || mimeType.isEmpty()) mimeType = "image/png";
+        if (relativeDir == null) relativeDir = "";
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            final ContentResolver cr = getContentResolver();
+            final ContentValues values = new ContentValues();
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, displayName);
+            values.put(MediaStore.Images.Media.MIME_TYPE, mimeType);
+            values.put(MediaStore.Images.Media.RELATIVE_PATH,
+                       relativeDir.isEmpty() ? "Pictures" : "Pictures/" + relativeDir);
+            values.put(MediaStore.Images.Media.IS_PENDING, 1);
+
+            Uri uri = null;
+            try {
+                uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (uri == null) return null;
+                try (java.io.OutputStream out = cr.openOutputStream(uri)) {
+                    if (out == null) throw new java.io.IOException("no output stream");
+                    out.write(data);
+                }
+                values.clear();
+                values.put(MediaStore.Images.Media.IS_PENDING, 0);
+                cr.update(uri, values, null, null);
+                return uri.toString();
+            } catch (Exception e) {
+                Log.e(TAG, "publishImage failed", e);
+                // Leave no half-written pending row behind: it would be
+                // invisible to the gallery and invisible to the user, i.e.
+                // unreclaimable space.
+                if (uri != null) {
+                    try { cr.delete(uri, null, null); } catch (Exception ignored) {}
+                }
+                return null;
+            }
+        }
+
+        try {
+            final java.io.File dir = new java.io.File(
+                android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_PICTURES),
+                relativeDir);
+            if (!dir.exists() && !dir.mkdirs()) return null;
+            final java.io.File file = new java.io.File(dir, displayName);
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(file)) {
+                out.write(data);
+            }
+            MediaScannerConnection.scanFile(this, new String[]{file.getAbsolutePath()},
+                                            new String[]{mimeType}, null);
+            return Uri.fromFile(file).toString();
+        } catch (Exception e) {
+            Log.e(TAG, "publishImage (legacy) failed", e);
+            return null;
+        }
+    }
+
+    /**
+     * The bytes this activity was launched to open, or {@code null} when it
+     * was not launched with any.
+     *
+     * <p>Native code cannot do this for itself, and the reason is not a
+     * missing binding: a file manager launches a viewer with
+     * {@code ACTION_VIEW} and a {@code content://} URI, which names a row in
+     * some other app's {@link android.content.ContentProvider}. There is no
+     * path behind it, so no {@code open()} reaches it, and the permission that
+     * lets us read it at all was granted to this Intent rather than to this
+     * process. Only a {@link android.content.ContentResolver} can resolve
+     * that, and only Java has one.
+     *
+     * <p>Distinct from {@code externalStorageRoot()} above, which answers the
+     * other half of the same problem — that one is for an app given a
+     * DIRECTORY to walk with {@code std::filesystem}, this one is for an app
+     * handed a single DOCUMENT it may not otherwise reach.
+     *
+     * <p>Read whole rather than streamed. What arrives this way is one file a
+     * user picked in a file manager, and the caller is a native app that wants
+     * to decode or parse it — a streaming seam would add a handle to own and a
+     * lifetime to get wrong for every consumer, to save nothing on the sizes
+     * this is actually used at. A consumer opening multi-gigabyte files should
+     * ask for a file descriptor instead, and that is a different method.
+     *
+     * <p>Returns {@code null}, never throws, for every failure — no data URI,
+     * a provider that has gone away, a revoked permission, an I/O error. The
+     * native side gets "nothing to show", which is a state an app must handle
+     * regardless of the reason.
+     */
+    @SuppressWarnings("unused")
+    public byte[] readIntentData() {
+        final Intent intent = getIntent();
+        if (intent == null) return null;
+        final Uri uri = intent.getData();
+        if (uri == null) return null;
+
+        java.io.InputStream in = null;
+        try {
+            in = getContentResolver().openInputStream(uri);
+            if (in == null) return null;
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(1 << 16);
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            return out.toByteArray();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (in != null) try { in.close(); } catch (java.io.IOException ignored) {}
+        }
+    }
+
+    /**
+     * The intent's data URI as an open file DESCRIPTOR, or -1.
+     *
+     * <p>The method {@link #readIntentData()}'s documentation points at: a
+     * consumer opening a file too large to hold in memory asks for this
+     * instead. A video player is exactly that consumer — the recordings that
+     * motivated this are hundreds of megabytes to several gigabytes, and
+     * reading one into a byte[] to parse its header is not a trade, it is an
+     * OutOfMemoryError.
+     *
+     * <p>The descriptor is DETACHED: ownership passes to the caller, which
+     * must close() it. Left attached, the ParcelFileDescriptor's finalizer
+     * would close it out from under native code at an unpredictable moment.
+     *
+     * <p>"r" rather than "rw": a viewer opened on someone's document has no
+     * business asking for write access, and many providers refuse it outright.
+     *
+     * <p>Returns -1, never throws, for every failure — no data URI, a provider
+     * that has gone away, a revoked grant, a URI that names no openable file.
+     */
+    @SuppressWarnings("unused")
+    public int openIntentDataFd() {
+        final Intent intent = getIntent();
+        if (intent == null) return -1;
+        final Uri uri = intent.getData();
+        if (uri == null) return -1;
+        try {
+            android.os.ParcelFileDescriptor pfd =
+                    getContentResolver().openFileDescriptor(uri, "r");
+            if (pfd == null) return -1;
+            return pfd.detachFd();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * The intent's data URI as a real filesystem PATH, or null.
+     *
+     * <p>Only for a {@code file://} URI, which is what a few file managers
+     * still send and what {@code adb shell am start -d file://...} produces.
+     * A {@code content://} URI has no path behind it and is never guessed at
+     * here — {@link #openIntentDataFd()} is the answer for those.
+     *
+     * <p>Preferred over the descriptor when it is available: a path can be
+     * reopened, which a detached fd cannot, and an app that wants to seek
+     * around a file across a lifecycle bounce needs that.
+     */
+    @SuppressWarnings("unused")
+    public String getIntentDataPath() {
+        final Intent intent = getIntent();
+        if (intent == null) return null;
+        final Uri uri = intent.getData();
+        if (uri == null) return null;
+        if (!"file".equals(uri.getScheme())) return null;
+        return uri.getPath();
     }
 
     @SuppressWarnings("unused")
@@ -281,5 +700,17 @@ public class AppShellActivity extends NativeActivity {
         if (clip == null || clip.getItemCount() == 0) return "";
         CharSequence s = clip.getItemAt(0).coerceToText(this);
         return s == null ? "" : s.toString();
+    }
+
+    /**
+     * Keep the panel lit while native code is in a long job. Window flags
+     * belong to the UI thread; the native caller may be the glue thread.
+     */
+    @SuppressWarnings("unused")
+    public void setKeepScreenOn(final boolean on) {
+        runOnUiThread(() -> {
+            if (on) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            else    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        });
     }
 }

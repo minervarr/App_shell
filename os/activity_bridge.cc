@@ -101,6 +101,27 @@ std::string call_string(const char* name) {
     return out;
 }
 
+float call_float(const char* name, float fallback) {
+    if (!g_app) return fallback;
+    JNIEnv* env = env_for(g_app);
+    if (!env) return fallback;
+    jobject act = g_app->activity->clazz;
+    jclass  cls = env->GetObjectClass(act);
+    jmethodID m = env->GetMethodID(cls, name, "()F");
+    if (!m) {
+        // A consumer whose Activity does not extend AppShellActivity gets here.
+        // Not an error: it means "this app never opted in", and the fallback is
+        // the answer for that.
+        check_exc(env, name);
+        env->DeleteLocalRef(cls);
+        return fallback;
+    }
+    jfloat v = env->CallFloatMethod(act, m);
+    bool bad = check_exc(env, name);
+    env->DeleteLocalRef(cls);
+    return bad ? fallback : (float)v;
+}
+
 bool call_with_string(const char* name, const std::string& arg) {
     if (!g_app) return false;
     JNIEnv* env = env_for(g_app);
@@ -147,7 +168,82 @@ std::string get_clipboard() { return call_string("getClipboard"); }
 
 bool open_url(const std::string& url) { return call_with_string("openUrl", url); }
 
+void set_keep_screen_on(bool on) {
+    jvalue v;
+    v.z = on ? JNI_TRUE : JNI_FALSE;
+    call_void("setKeepScreenOn", "(Z)V", &v);
+}
+
 std::string external_storage_root() { return call_string("externalStorageRoot"); }
+
+std::string publish_image(const std::string& display_name,
+                          const std::string& mime_type,
+                          const std::string& relative_dir,
+                          const uint8_t* data, size_t bytes) {
+    if (!g_app || !data || bytes == 0) return {};
+    JNIEnv* env = env_for(g_app);
+    if (!env) return {};
+
+    jbyteArray arr = env->NewByteArray((jsize)bytes);
+    if (!arr) {
+        // A failed allocation leaves a pending exception that would abort the
+        // next JNI call made anywhere, not just here.
+        env->ExceptionClear();
+        return {};
+    }
+    env->SetByteArrayRegion(arr, 0, (jsize)bytes,
+                            reinterpret_cast<const jbyte*>(data));
+
+    jstring jname = to_jstring(env, display_name);
+    jstring jmime = to_jstring(env, mime_type);
+    jstring jdir  = to_jstring(env, relative_dir);
+
+    std::string out;
+    jobject act = g_app->activity->clazz;
+    {
+        jclass cls = env->GetObjectClass(act);
+        jmethodID mid = env->GetMethodID(
+            cls, "publishImage",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[B)"
+            "Ljava/lang/String;");
+        if (mid) {
+            jstring res = (jstring)env->CallObjectMethod(act, mid, jname, jmime,
+                                                         jdir, arr);
+            if (!check_exc(env, "publishImage") && res) {
+                // GetStringChars, NOT GetStringUTFChars -- the latter is
+                // modified UTF-8 and mangles anything outside the BMP.
+                const jchar* u = env->GetStringChars(res, nullptr);
+                jsize len = env->GetStringLength(res);
+                out = utf16::to_utf8(reinterpret_cast<const uint16_t*>(u),
+                                     (size_t)len);
+                env->ReleaseStringChars(res, u);
+            }
+            if (res) env->DeleteLocalRef(res);
+        } else {
+            env->ExceptionClear();
+        }
+        env->DeleteLocalRef(cls);
+    }
+
+    env->DeleteLocalRef(jdir);
+    env->DeleteLocalRef(jmime);
+    env->DeleteLocalRef(jname);
+    env->DeleteLocalRef(arr);
+    return out;
+}
+
+float display_hdr_headroom() { return call_float("displayHdrHeadroom", 1.0f); }
+float display_dpi()            { return call_float("displayDpi", 0.0f); }
+
+void request_orientation(int mode) {
+    jvalue v;
+    v.i = (jint)mode;
+    // Failure is silent by design. A consumer whose Activity does not extend
+    // AppShellActivity has no such method, which call_void() reports by
+    // clearing the exception and returning false — and the correct behaviour
+    // there is exactly what happens anyway: the device keeps deciding.
+    call_void("requestOrientation", "(I)V", &v);
+}
 
 bool drain(Update& out) {
     std::lock_guard<std::mutex> lock(g_pending.mu);

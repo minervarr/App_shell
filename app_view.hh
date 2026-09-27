@@ -55,6 +55,36 @@ public:
     // onHostReady(), so one-time init belongs there, not here.
     virtual void onAppForegrounded() {}
 
+    // The window now HAS INPUT FOCUS — a stronger statement than being visible,
+    // and the two are not the same moment: Android hands an app its surface,
+    // lets it draw a frame, and only then gives the window focus.
+    //
+    // It exists because anything an app asks of the input system before that
+    // point is discarded. A launcher that raises the IME from onHostReady()
+    // gets "Ignoring showSoftInput() ... is not served" from
+    // InputMethodManager and a home screen with no keyboard, which is not a
+    // bug the app can fix on its own side: the moment it needs to wait for is
+    // one only the host can see. Fires on every focus gain, so an app doing
+    // one-time work here must guard it itself.
+    //
+    // Wayland and Win32 do not report it today; an app that only runs there
+    // never sees it and must not depend on it as its sole trigger.
+    virtual void onHostFocusGained() {}
+
+    // The window has LOST input focus: a notification shade pulled down, a
+    // permission dialog, a phone call, the recents switcher, or the user simply
+    // leaving. The counterpart to onHostFocusGained(), and the earliest moment
+    // an app is told it is no longer the thing being looked at.
+    //
+    // Earlier than losing the surface, which is the distinction that matters.
+    // onSurfaceLost() fires when the window is actually torn down, which for a
+    // backgrounded app can be seconds later or not at all; anything that should
+    // stop the moment the user's attention leaves — playback above all — has to
+    // hang off this instead.
+    //
+    // Wayland and Win32 do not report it today, exactly as with the gain.
+    virtual void onHostFocusLost() {}
+
     // Keyboard, in the portable key::* space (vk_canvas's keys.hh), never in
     // the platform's own keycodes.
     virtual void onKeyDownPortable(int keyCode) {}
@@ -126,6 +156,36 @@ public:
     // onDragEnd, which is deliberately silent below the host's slop.
     virtual void onLButtonUp(int x, int y) {}
     virtual void onLButtonDblClk(int x, int y) {}
+
+    // ── Raw multi-pointer touch ─────────────────────────────────────────────
+    //
+    // The callbacks above are ONE pointer, because a mouse is one pointer and
+    // they were shaped by a desktop. A touch screen is not: a pinch is two
+    // fingers whose DISTANCE is the whole signal, and no amount of
+    // single-pointer history reconstructs it — the midpoint of two fingers can
+    // sit perfectly still while they separate.
+    //
+    // So these carry the pointer's IDENTITY, and are delivered raw: no slop,
+    // no tap/drag classification, no synthesis into a wheel. A host reports
+    // every pointer it sees; what a second finger MEANS is the app's question,
+    // exactly as onAppEvent's integer is.
+    //
+    // They are additive. Android keeps synthesising the single-pointer events
+    // above from pointer 0 as it always did, so an app that overrides nothing
+    // here sees no change at all. An app that wants pinch overrides these and
+    // ignores those.
+    //
+    // `pointerId` is stable for the life of one finger's contact and is reused
+    // afterwards; it is NOT an index into anything. The desktops report their
+    // single pointer as id 0 — a documented narrowing in the same spirit as
+    // registerHotkey being system-wide on Win32 and focus-local on Wayland. A
+    // mouse genuinely has one pointer; pretending otherwise would be the fake.
+    virtual void onPointerDown(int pointerId, int x, int y) {}
+    virtual void onPointerMove(int pointerId, int x, int y) {}
+    // Fires for a lifted finger AND for a cancelled one (the window losing the
+    // gesture to a system edge swipe). An app that tracks a set of live
+    // pointers must remove on both or it strands a finger that never came up.
+    virtual void onPointerUp(int pointerId, int x, int y) {}
     virtual void onMouseWheel(int x, int y, int delta) {}
 
     // A drag that has ENDED: the pointer travelled dx,dy with the button held

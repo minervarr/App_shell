@@ -2,6 +2,7 @@
 #include <android_native_app_glue.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 // ── Talking to AppShellActivity ──────────────────────────────────────────────
@@ -55,6 +56,51 @@ std::string get_clipboard();
 // Caller must already have validated the scheme — see Host::openUrl.
 bool open_url(const std::string& url);
 
+// FLAG_KEEP_SCREEN_ON. The Java side posts the flag change to the UI thread.
+// A no-op when the activity has no setKeepScreenOn method.
+void set_keep_screen_on(bool on);
+
+// How far above SDR white this display can go, as a multiplier of it. 1.0
+// means no headroom -- an SDR panel, an activity that does not extend
+// AppShellActivity, or a display that will not say. Never below 1.0, so a
+// caller can multiply by it unconditionally.
+//
+// A REPORT ABOUT THE DISPLAY, not about what was granted. An app still has to
+// ask its surface which colourspace it actually got: a panel can have headroom
+// while the window is SDR, and the window's colour mode is a request the
+// system may refuse without saying so.
+float display_hdr_headroom();
+
+// Pixels per inch of the activity's display, 0 when unknown. See
+// AppShellActivity.displayDpi() for why this is xdpi and not densityDpi.
+float display_dpi();
+
+// ── Orientation ─────────────────────────────────────────────────────────────
+//
+// android.content.pm.ActivityInfo's SCREEN_ORIENTATION_* constants, named here
+// so callers do not scatter the integers. Only the three an app with a genuine
+// opinion about its content needs; the full table has eighteen.
+//
+// The SENSOR variants deliberately, not the plain ones: they pin the AXIS and
+// leave the user free to flip the device end for end within it. LANDSCAPE
+// alone picks one of the two landscapes and refuses the other, which reads as
+// a bug to anyone holding the phone the other way round.
+enum Orientation : int {
+    OrientationUnspecified    = -1,  // SCREEN_ORIENTATION_UNSPECIFIED
+    OrientationSensorLandscape = 6,  // SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+    OrientationSensorPortrait  = 7,  // SCREEN_ORIENTATION_SENSOR_PORTRAIT
+};
+
+// Ask to be held at `mode`. A REQUEST: the system may decline it, and a
+// foldable's outer display, a split-screen window or a device policy all can.
+// Nothing may depend on it having taken effect — the answer arrives later as a
+// configuration change, which reaches the app as an ordinary resize.
+//
+// Unspecified hands control back to the user's rotation setting, which is the
+// right thing to ask for whenever the app has no opinion. Overriding somebody's
+// rotation lock to no benefit is worse than a letterbox.
+void request_orientation(int mode);
+
 // Root of SHARED storage as a real path, e.g. "/storage/emulated/0". Empty if
 // the activity does not answer (which is what a consumer whose Activity does
 // not extend AppShellActivity gets); callers should fall back rather than
@@ -64,6 +110,20 @@ bool open_url(const std::string& url);
 // uninstall — the right place for a cache and the wrong place for a library
 // the user believes is theirs.
 std::string external_storage_root();
+
+// Publish an image into the user's shared Pictures collection. Returns the
+// content:// URI it landed at, or "" on failure.
+//
+// The ONLY supported way to put a picture where the gallery will find it from
+// API 29 on: scoped storage forbids creating files in a shared collection by
+// path, so a filesystem write to /sdcard/Pictures fails no matter how correct
+// the path looks. This goes through MediaStore, which needs a ContentResolver,
+// which only Java has. `relativeDir` is a sub-path under Pictures ("" for
+// Pictures itself).
+std::string publish_image(const std::string& display_name,
+                          const std::string& mime_type,
+                          const std::string& relative_dir,
+                          const uint8_t* data, size_t bytes);
 
 // ── Down-calls, collected ───────────────────────────────────────────────────
 

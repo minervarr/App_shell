@@ -6,7 +6,6 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <thread>
@@ -45,6 +44,10 @@ constexpr float kTouchSlopPx = 24.0f;
 // 1:1 content tracking, which is the only thing that feels right on a touch
 // screen.
 constexpr float kWheelPerPixel = 1.0f;
+
+// A lift is a stop. There is no coasting: the app snaps every list by whole
+// rows, and a throw that kept emitting wheel deltas after the finger left
+// would animate those steps. The drag itself is still 1:1 into wheel units.
 
 // The eventfd activity_bridge's waker writes to. A file-scope int rather than a
 // member because the waker is a plain function pointer with nowhere to keep a
@@ -194,6 +197,10 @@ bool AndroidHost::init(AppView* owner) {
     return surface_ != nullptr && assets_ != nullptr;
 }
 
+// xdpi via the activity bridge; see AppShellActivity.displayDpi() for why the
+// bucketed densityDpi is only the fallback.
+float AndroidHost::displayDpi() const { return activity::display_dpi(); }
+
 MonitorInfo AndroidHost::primaryMonitor() const {
     MonitorInfo mi{};
     if (state_->window) {
@@ -290,11 +297,10 @@ void AndroidHost::drainActivity() {
 }
 
 void AndroidHost::setKeepAwake(bool on) {
-    // Deliberately a no-op for now. It has a real Android equivalent
-    // (FLAG_KEEP_SCREEN_ON), but its only caller is the fullscreen artwork
-    // window, and ArtWindow declines to open on Android — so wiring it would
-    // be code with no path that reaches it. See art_view.hh.
-    (void)on;
+    // FLAG_KEEP_SCREEN_ON, applied on the UI thread by the activity. A long
+    // job (a denoise is over a minute) otherwise lets the panel sleep, and
+    // Android then freezes the process.
+    activity::set_keep_screen_on(on);
 }
 
 // ── The app command stream ───────────────────────────────────────────────────
@@ -305,6 +311,7 @@ void AndroidHost::handleAppCmd(android_app* app, int32_t cmd) {
         case APP_CMD_INIT_WINDOW:   if (app->window) self->onWindowInit(); break;
         case APP_CMD_TERM_WINDOW:   self->onWindowTerm();  break;
         case APP_CMD_GAINED_FOCUS:  self->onGainedFocus(); break;
+        case APP_CMD_LOST_FOCUS:    self->onLostFocus();   break;
         case APP_CMD_RESUME:        self->onResume();      break;
         case APP_CMD_PAUSE:         self->onPause();       break;
         case APP_CMD_WINDOW_RESIZED:
@@ -330,7 +337,13 @@ void AndroidHost::handleAppCmd(android_app* app, int32_t cmd) {
 // another activity covers this one and the listener comes back — treating it
 // as startup is what produced the permission loop this file used to have.
 void AndroidHost::onWindowInit() {
-    surface_ = std::make_unique<AndroidSurfaceProvider>(state_->window);
+    // Re-point the EXISTING provider when there is one, rather than making a
+    // new one. Renderer holds the provider by reference, so replacing the
+    // object would dangle that reference and force the whole Renderer to be
+    // rebuilt — which is exactly the ~370 ms of black this is here to remove.
+    // See AndroidSurfaceProvider::set_window and Renderer::recreate_surface.
+    if (surface_) surface_->set_window(state_->window);
+    else          surface_ = std::make_unique<AndroidSurfaceProvider>(state_->window);
     if (!assets_)
         assets_ = std::make_unique<AndroidAssetReader>(state_->activity->assetManager);
 
@@ -359,11 +372,16 @@ void AndroidHost::onWindowInit() {
 }
 
 void AndroidHost::onWindowTerm() {
-    // The Renderer, the swapchain and every texture belong to the surface
-    // that is going away. PlayerWindow keeps its database, its library and
-    // its playback: the listener left the app, they did not restart it.
+    // The SURFACE is going away — not the device, and not the app. PlayerWindow
+    // keeps its database, its library and its playback: the listener left the
+    // app, they did not restart it.
+    //
+    // The provider is deliberately NOT reset here any more. Renderer holds it
+    // by reference and still needs it alive to destroy its old VkSurfaceKHR
+    // and make the next one; onWindowInit() re-points it at the new window.
+    // Destroying it here is what used to force the whole Renderer to go with
+    // it.
     if (owner_) owner_->onSurfaceLost();
-    surface_.reset();
 }
 
 void AndroidHost::onGainedFocus() {
@@ -372,6 +390,18 @@ void AndroidHost::onGainedFocus() {
     // every APP_CMD_GAINED_FOCUS, not just at startup.
     if (state_->window)
         vce::platform::enable_immersive(state_, vce::platform::ImmersiveMode::kFullImmersive);
+
+    // The app is told, because this is the first moment the input system will
+    // accept anything from it — see AppView::onHostFocusGained().
+    if (owner_) owner_->onHostFocusGained();
+}
+
+void AndroidHost::onLostFocus() {
+    // No immersive flags to re-apply and nothing to re-query: this exists
+    // purely to tell the app, because losing focus is the earliest and most
+    // reliable signal that the user has looked away. APP_CMD_PAUSE follows it
+    // and APP_CMD_TERM_WINDOW may follow that, seconds later or never.
+    if (owner_) owner_->onHostFocusLost();
 }
 
 void AndroidHost::onResume() {
@@ -463,27 +493,112 @@ int32_t AndroidHost::handleInputEvent(android_app* app, AInputEvent* event) {
     auto* self = reinterpret_cast<AndroidHost*>(app->userData);
     if (!self->owner_ || AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) return 0;
 
+    const int32_t action = AMotionEvent_getAction(event);
+    const int32_t masked  = action & AMOTION_EVENT_ACTION_MASK;
+
+    // ── The raw multi-pointer stream ────────────────────────────────────────
+    //
+    // Reported FIRST and separately from the single-pointer synthesis below,
+    // which is left exactly as it was. The two are different questions: this
+    // one is "which fingers are where", and that one is "was that a tap, a
+    // drag or a scroll". Answering the second has never needed the second
+    // finger; a pinch cannot be answered without it.
+    //
+    // ACTION_POINTER_DOWN/UP name ONE pointer, carried in the action's high
+    // bits, and MOVE names none — it is a batch covering every pointer still
+    // down. That asymmetry is why this is a switch and not one loop.
+    const int32_t idx = (action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
+                        >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+    switch (masked) {
+        case AMOTION_EVENT_ACTION_DOWN:
+        case AMOTION_EVENT_ACTION_POINTER_DOWN:
+            self->owner_->onPointerDown((int)AMotionEvent_getPointerId(event, idx),
+                                        (int)AMotionEvent_getX(event, idx),
+                                        (int)AMotionEvent_getY(event, idx));
+            break;
+        case AMOTION_EVENT_ACTION_UP:
+        case AMOTION_EVENT_ACTION_POINTER_UP:
+            self->owner_->onPointerUp((int)AMotionEvent_getPointerId(event, idx),
+                                      (int)AMotionEvent_getX(event, idx),
+                                      (int)AMotionEvent_getY(event, idx));
+            break;
+        case AMOTION_EVENT_ACTION_MOVE: {
+            const size_t n = AMotionEvent_getPointerCount(event);
+            for (size_t i = 0; i < n; ++i)
+                self->owner_->onPointerMove((int)AMotionEvent_getPointerId(event, i),
+                                            (int)AMotionEvent_getX(event, i),
+                                            (int)AMotionEvent_getY(event, i));
+            break;
+        }
+        case AMOTION_EVENT_ACTION_CANCEL: {
+            // Every live pointer is gone at once. Reported as an up for each,
+            // because an app tracking a set of fingers would otherwise strand
+            // all of them — see the note on AppView::onPointerUp.
+            const size_t n = AMotionEvent_getPointerCount(event);
+            for (size_t i = 0; i < n; ++i)
+                self->owner_->onPointerUp((int)AMotionEvent_getPointerId(event, i),
+                                          (int)AMotionEvent_getX(event, i),
+                                          (int)AMotionEvent_getY(event, i));
+            break;
+        }
+        default: break;
+    }
+
+    // ── The single-pointer synthesis, unchanged ─────────────────────────────
+    //
+    // Pointer 0 only, and deliberately: a tap or a scroll is a one-finger
+    // gesture, and feeding it a second finger's coordinates would make every
+    // existing consumer misbehave the moment a palm touched the screen.
     const float x = AMotionEvent_getX(event, 0);
     const float y = AMotionEvent_getY(event, 0);
-    switch (AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK) {
+    switch (masked) {
         case AMOTION_EVENT_ACTION_DOWN:   self->onTouchDown(x, y);        return 1;
         case AMOTION_EVENT_ACTION_MOVE:   self->onTouchMove(x, y);        return 1;
         case AMOTION_EVENT_ACTION_UP:     self->onTouchUp(x, y, false);   return 1;
         case AMOTION_EVENT_ACTION_CANCEL: self->onTouchUp(x, y, true);    return 1;
+        // A second finger arriving or leaving is not a tap, a drag or a
+        // scroll, so the synthesis ignores it — but it WAS reported above, and
+        // the event is consumed either way.
+        case AMOTION_EVENT_ACTION_POINTER_DOWN:
+        case AMOTION_EVENT_ACTION_POINTER_UP:                             return 1;
         default: return 0;
     }
 }
 
 void AndroidHost::onTouchDown(float x, float y) {
+    // A finger on the glass cancels leftover drag carry. There is no fling
+    // to stop: a lift already ended the scroll.
     touchStartX_ = x;
     touchStartY_ = y;
     touchLastY_  = y;
+    dragRemainder_ = 0.0f;
     touchDragging_ = false;
     touchDown_     = true;
     // Hover follows the finger so the app can light what is under it. It is
     // the only hover a touch screen has, and it is honest: the desktop's
     // hover means "the pointer is here", and here it is.
     owner_->onMouseMove((int)x, (int)y);
+
+    // The press goes out at CONTACT, as it does on every desktop host. It used
+    // to be synthesised at release instead, which reads as harmless until an
+    // app wants the two edges apart: a press-and-hold cannot be recognised
+    // while the finger is down if the app is only told about the finger after
+    // it has left, and an app that acts on the release is never told at all.
+    // A stroke that turns into a scroll is retracted by onDragEnd() below,
+    // which is the signal that already means "that was a gesture, not a press".
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    const bool isDouble =
+        lastTapValid_ &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTapTime_).count() < 400 &&
+        std::fabs(x - lastTapX_) < kTouchSlopPx && std::fabs(y - lastTapY_) < kTouchSlopPx;
+
+    if (isDouble) {
+        owner_->onLButtonDblClk((int)x, (int)y);
+        lastTapValid_ = false;   // don't chain a third tap into another double
+    } else {
+        owner_->onLButtonDown((int)x, (int)y);
+    }
 }
 
 void AndroidHost::onTouchMove(float x, float y) {
@@ -492,29 +607,46 @@ void AndroidHost::onTouchMove(float x, float y) {
         const float dx = x - touchStartX_, dy = y - touchStartY_;
         if (std::sqrt(dx * dx + dy * dy) <= kTouchSlopPx) return;   // still a tap
         touchDragging_ = true;
+        // The slop is SPENT, not banked. It is the distance that decided this
+        // was a scroll at all, and feeding it to the wheel as one delta made
+        // the content jump a finger's width the moment a drag was recognised —
+        // which reads as the list being sticky and then lurching. Restarting
+        // the measurement here means the scroll begins exactly where the
+        // gesture was admitted, and 1:1 from there.
+        touchLastY_    = y;
+        dragRemainder_ = 0.0f;   // the slop is spent; start the carry clean
+        return;
     }
     // Past the slop the gesture belongs to scrolling, for good. The wheel is
     // fed the finger's own displacement since the last event, so content
-    // tracks the finger rather than stepping.
+    // tracks the finger rather than stepping. The app then snaps that travel
+    // onto whole rows; this host does not throw after a lift.
+    const float dy = y - touchLastY_;
+    // Sub-pixel travel is CARRIED, never rounded away.
     //
-    // Only the whole units actually delivered are consumed: advancing the
-    // anchor to `y` would round away everything below one unit, and a slow
-    // deliberate drag is made of exactly those fractions — it would travel a
-    // visibly shorter distance than a fast drag across the same pixels. Keeping
-    // the remainder makes the gesture's total displacement independent of how
-    // fast the finger moved and of the event rate.
-    const float moved = (y - touchLastY_) * kWheelPerPixel;
-    const int   delta = (int)std::trunc(moved);
-    if (delta != 0) {
-        touchLastY_ += (float)delta / kWheelPerPixel;
-        owner_->onMouseWheel((int)x, (int)y, delta);
-    }
+    // onMouseWheel takes an int, and a drag slower than one pixel per touch
+    // sample rounds to zero. On a 120 Hz screen that is an ordinary slow drag:
+    // every sample is discarded, the content does not move at all, and the
+    // list feels stuck exactly when it is being moved carefully.
+    //
+    // Accumulating the fraction instead means a 0.4 px sample is not lost --
+    // it lands as a 1 px step every third sample, and the average speed is
+    // exactly the finger's.
+    dragRemainder_ += dy * kWheelPerPixel;
+    const int delta = (int)std::lround(dragRemainder_);
+    dragRemainder_ -= (float)delta;
+    touchLastY_    = y;
+    if (delta != 0) owner_->onMouseWheel((int)x, (int)y, delta);
 }
 
 void AndroidHost::onTouchUp(float x, float y, bool cancelled) {
     const bool wasTap  = touchDown_ && !touchDragging_ && !cancelled;
-    const bool wasDrag = touchDown_ &&  touchDragging_ && !cancelled;
+    const bool wasDrag = touchDown_ && (touchDragging_ || cancelled);
     const float dx = x - touchStartX_, dy = y - touchStartY_;
+
+    // A lift is a lift. The drag already emitted its wheel deltas; nothing
+    // continues after the finger leaves.
+
     touchDown_     = false;
     touchDragging_ = false;
 
@@ -523,30 +655,26 @@ void AndroidHost::onTouchUp(float x, float y, bool cancelled) {
     // about the WHOLE stroke rather than its increments (the artwork's swipe);
     // the slop that decided this was a drag at all stays here, because it is a
     // property of a touch screen and not of the app.
+    //
+    // A CANCELLED stroke goes down this path too. The system took the gesture
+    // away — a notification shade, a back gesture, another window — and the
+    // press that went out at contact has to be retracted before the release
+    // below arrives, or the app would treat the interruption as a choice.
     if (wasDrag) owner_->onDragEnd((int)dx, (int)dy);
+
+    // The release, always: a tap, a drag and a cancellation all end with the
+    // finger off the glass, and an app holding a pressed state has no other
+    // way to learn that. What the release MEANS is the app's question; the
+    // ordering above is what lets it answer.
+    owner_->onLButtonUp((int)x, (int)y);
+
     if (!wasTap) return;
 
-    // A press is delivered at RELEASE, not at contact. That is what makes a
-    // drag able to change its mind: the finger has to come off in the same
-    // place for anything to be pressed at all.
-    using Clock = std::chrono::steady_clock;
-    const auto now = Clock::now();
-    const bool isDouble =
-        lastTapValid_ &&
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTapTime_).count() < 400 &&
-        std::fabs(x - lastTapX_) < kTouchSlopPx && std::fabs(y - lastTapY_) < kTouchSlopPx;
-
-    lastTapTime_ = now;
+    // Only a real tap seeds the double-tap window, measured release to
+    // contact — onTouchDown() is where the second one is recognised.
+    lastTapTime_  = std::chrono::steady_clock::now();
     lastTapX_ = x; lastTapY_ = y;
     lastTapValid_ = true;
-
-    owner_->onMouseMove((int)x, (int)y);
-    if (isDouble) {
-        owner_->onLButtonDblClk((int)x, (int)y);
-        lastTapValid_ = false;   // don't chain a third tap into another double
-    } else {
-        owner_->onLButtonDown((int)x, (int)y);
-    }
 }
 
 // ── Cross-thread events and the seek timer ───────────────────────────────────
@@ -618,9 +746,12 @@ void AndroidHost::pump(bool haveWork) {
     // Blocking when there is nothing to draw is what keeps a phone's battery
     // out of this: with no pending frame the process sleeps in the kernel
     // until a touch, a timer, or a background thread's eventfd wakes it.
+    // With a frame already pending the draw paces us and the wait stays zero.
+    const int timeout = haveWork ? 0 : -1;
+
     int events;
     android_poll_source* source = nullptr;
-    const int ident = ALooper_pollOnce(haveWork ? 0 : -1, nullptr, &events,
+    const int ident = ALooper_pollOnce(timeout, nullptr, &events,
                                        reinterpret_cast<void**>(&source));
     if (ident >= 0) {
         if (source) source->process(state_, source);
